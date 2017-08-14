@@ -45,6 +45,10 @@ DEFAULTS = {
         'default': 'True',
         'type': bool,
     },
+    'invoice_name_required': {
+        'default': 'False',
+        'type': bool,
+    },
     'invoice_address_required': {
         'default': 'False',
         'type': bool,
@@ -60,6 +64,10 @@ DEFAULTS = {
     'invoice_numbers_consecutive': {
         'default': 'True',
         'type': bool,
+    },
+    'invoice_numbers_prefix': {
+        'default': '',
+        'type': str,
     },
     'invoice_renderer': {
         'default': 'classic',
@@ -345,6 +353,32 @@ You can view the details of your order at
 Best regards,
 Your {event} team"""))
     },
+    'mail_text_order_custom_mail': {
+        'type': LazyI18nString,
+        'default': LazyI18nString.from_gettext(ugettext_noop("""Hello,
+
+You can change your order details and view the status of your order at
+{url}
+
+Best regards,
+Your {event} team"""))
+    },
+    'mail_days_download_reminder': {
+        'type': int,
+        'default': None
+    },
+    'mail_text_download_reminder': {
+        'type': LazyI18nString,
+        'default': LazyI18nString.from_gettext(ugettext_noop("""Hello,
+
+you bought a ticket for {event}.
+
+If you did not do so already, you can download your ticket here:
+{url}
+
+Best regards,
+Your {event} team"""))
+    },
     'smtp_use_custom': {
         'default': 'False',
         'type': bool
@@ -394,6 +428,10 @@ Your {event} team"""))
         'type': File
     },
     'frontpage_text': {
+        'default': '',
+        'type': LazyI18nString
+    },
+    'organizer_info_text': {
         'default': '',
         'type': LazyI18nString
     },

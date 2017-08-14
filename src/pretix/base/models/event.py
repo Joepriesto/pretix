@@ -1,5 +1,6 @@
 import string
 import uuid
+from collections import OrderedDict
 from datetime import datetime, time
 
 import pytz
@@ -22,6 +23,7 @@ from pretix.base.models.base import LoggedModel
 from pretix.base.reldate import RelativeDateWrapper
 from pretix.base.validators import EventSlugBlacklistValidator
 from pretix.helpers.daterange import daterange
+from pretix.helpers.json import safe_string
 
 from ..settings import settings_hierarkey
 from .organizer import Organizer
@@ -102,6 +104,30 @@ class EventMixin:
         if self.presale_end and now() > self.presale_end:
             return False
         return True
+
+    @property
+    def event_microdata(self):
+        import json
+
+        eventdict = {
+            "@context": "http://schema.org",
+            "@type": "Event", "location": {
+                "@type": "Place",
+                "address": str(self.location)
+            },
+            "name": str(self.name)
+        }
+
+        if self.settings.show_times:
+            eventdict["startDate"] = self.date_from.isoformat()
+            if self.settings.show_date_to and self.date_to is not None:
+                eventdict["endDate"] = self.date_to.isoformat()
+        else:
+            eventdict["startDate"] = self.date_from.date().isoformat()
+            if self.settings.show_date_to and self.date_to is not None:
+                eventdict["endDate"] = self.date_to.date().isoformat()
+
+        return safe_string(json.dumps(eventdict))
 
 
 @settings_hierarkey.add(parent_field='organizer', cache_namespace='event')
@@ -363,7 +389,8 @@ class Event(EventMixin, LoggedModel):
             for p in response:
                 pp = p(self)
                 providers[pp.identifier] = pp
-        return providers
+
+        return OrderedDict(sorted(providers.items(), key=lambda v: str(v[1].verbose_name)))
 
     def get_invoice_renderers(self) -> dict:
         """

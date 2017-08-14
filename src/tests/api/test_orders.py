@@ -3,6 +3,7 @@ from decimal import Decimal
 from unittest import mock
 
 import pytest
+from django_countries.fields import Country
 from pytz import UTC
 
 from pretix.base.models import InvoiceAddress, Order, OrderPosition
@@ -29,7 +30,7 @@ def order(event, item):
             expires=datetime.datetime(2017, 12, 10, 10, 0, 0, tzinfo=UTC),
             total=23, payment_provider='banktransfer', locale='en'
         )
-        InvoiceAddress.objects.create(order=o, company="Sample company")
+        InvoiceAddress.objects.create(order=o, company="Sample company", country=Country('NZ'))
         OrderPosition.objects.create(
             order=o,
             item=item,
@@ -82,7 +83,7 @@ TEST_ORDER_RES = {
         "street": "",
         "zipcode": "",
         "city": "",
-        "country": "",
+        "country": "NZ",
         "vat_id": ""
     },
     "positions": [TEST_ORDERPOSITION_RES],
@@ -256,10 +257,10 @@ def invoice(order):
 
 TEST_INVOICE_RES = {
     "order": "FOO",
-    "invoice_no": "00001",
+    "number": "DUMMY-00001",
     "is_cancellation": False,
     "invoice_from": "",
-    "invoice_to": "Sample company",
+    "invoice_to": "Sample company\n\n\n \nNew Zealand",
     "date": "2017-12-10",
     "refers": None,
     "locale": "en",
@@ -291,10 +292,10 @@ def test_invoice_list(token_client, organizer, event, order, invoice):
     resp = token_client.get('/api/v1/organizers/{}/events/{}/invoices/?order=BAR'.format(organizer.slug, event.slug))
     assert [] == resp.data['results']
 
-    resp = token_client.get('/api/v1/organizers/{}/events/{}/invoices/?invoice_no={}'.format(
-        organizer.slug, event.slug, invoice.invoice_no))
+    resp = token_client.get('/api/v1/organizers/{}/events/{}/invoices/?number={}'.format(
+        organizer.slug, event.slug, invoice.number))
     assert [res] == resp.data['results']
-    resp = token_client.get('/api/v1/organizers/{}/events/{}/invoices/?invoice_no=XXX'.format(
+    resp = token_client.get('/api/v1/organizers/{}/events/{}/invoices/?number=XXX'.format(
         organizer.slug, event.slug))
     assert [] == resp.data['results']
 
@@ -313,15 +314,15 @@ def test_invoice_list(token_client, organizer, event, order, invoice):
     resp = token_client.get('/api/v1/organizers/{}/events/{}/invoices/?is_cancellation=true'.format(
         organizer.slug, event.slug))
     assert len(resp.data['results']) == 1
-    assert resp.data['results'][0]['invoice_no'] == ic.invoice_no
+    assert resp.data['results'][0]['number'] == ic.number
 
     resp = token_client.get('/api/v1/organizers/{}/events/{}/invoices/?refers={}'.format(
-        organizer.slug, event.slug, invoice.invoice_no))
+        organizer.slug, event.slug, invoice.number))
     assert len(resp.data['results']) == 1
-    assert resp.data['results'][0]['invoice_no'] == ic.invoice_no
+    assert resp.data['results'][0]['number'] == ic.number
 
     resp = token_client.get('/api/v1/organizers/{}/events/{}/invoices/?refers={}'.format(
-        organizer.slug, event.slug, ic.invoice_no))
+        organizer.slug, event.slug, ic.number))
     assert [] == resp.data['results']
 
 
@@ -330,6 +331,6 @@ def test_invoice_detail(token_client, organizer, event, invoice):
     res = dict(TEST_INVOICE_RES)
 
     resp = token_client.get('/api/v1/organizers/{}/events/{}/invoices/{}/'.format(organizer.slug, event.slug,
-                                                                                  invoice.invoice_no))
+                                                                                  invoice.number))
     assert resp.status_code == 200
     assert res == resp.data

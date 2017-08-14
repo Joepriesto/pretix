@@ -37,8 +37,11 @@ def build_invoice(invoice: Invoice) -> Invoice:
 {i.name}
 {i.street}
 {i.zipcode} {i.city}
-{i.country}""")
-            invoice.invoice_to = addr_template.format(i=invoice.order.invoice_address).strip()
+{country}""")
+            invoice.invoice_to = addr_template.format(
+                i=invoice.order.invoice_address,
+                country=invoice.order.invoice_address.country.name if invoice.order.invoice_address.country else invoice.order.invoice_address.country_old
+            ).strip()
             if invoice.order.invoice_address.vat_id:
                 invoice.invoice_to += "\n" + pgettext("invoice", "VAT-ID: %s") % invoice.order.invoice_address.vat_id
         except InvoiceAddress.DoesNotExist:
@@ -96,6 +99,7 @@ def generate_cancellation(invoice: Invoice):
     cancellation = copy.copy(invoice)
     cancellation.pk = None
     cancellation.invoice_no = None
+    cancellation.prefix = None
     cancellation.refers = invoice
     cancellation.is_cancellation = True
     cancellation.date = timezone.now().date()
@@ -125,6 +129,7 @@ def generate_invoice(order: Order):
     invoice = Invoice(
         order=order,
         event=order.event,
+        organizer=order.event.organizer,
         date=timezone.now().date(),
         locale=locale
     )
@@ -171,7 +176,7 @@ def build_preview_invoice_pdf(event):
                                     expires=timezone.now(), code="PREVIEW", total=119)
         invoice = Invoice(
             order=order, event=event, invoice_no="PREVIEW",
-            date=timezone.now().date(), locale=locale
+            date=timezone.now().date(), locale=locale, organizer=event.organizer
         )
         invoice.invoice_from = event.settings.get('invoice_address_from')
 

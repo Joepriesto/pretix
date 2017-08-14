@@ -2,7 +2,9 @@ from datetime import timedelta
 from decimal import Decimal
 
 import pytest
+from django.db import DatabaseError
 from django.utils.timezone import now
+from django_countries.fields import Country
 
 from pretix.base.models import (
     Event, Invoice, InvoiceAddress, Item, ItemVariation, Order, OrderPosition,
@@ -71,14 +73,25 @@ def test_locale_user(env):
 
 
 @pytest.mark.django_db
+def test_address_old_country(env):
+    event, order = env
+    event.settings.set('invoice_language', 'en')
+    InvoiceAddress.objects.create(company='Acme Company', street='221B Baker Street',
+                                  zipcode='12345', city='London', country_old='England', country='',
+                                  order=order)
+    inv = generate_invoice(order)
+    assert inv.invoice_to == "Acme Company\n\n221B Baker Street\n12345 London\nEngland"
+
+
+@pytest.mark.django_db
 def test_address(env):
     event, order = env
     event.settings.set('invoice_language', 'en')
     InvoiceAddress.objects.create(company='Acme Company', street='221B Baker Street',
-                                  zipcode='12345', city='London', country='UK',
+                                  zipcode='12345', city='London', country=Country('GB'),
                                   order=order)
     inv = generate_invoice(order)
-    assert inv.invoice_to == "Acme Company\n\n221B Baker Street\n12345 London\nUK"
+    assert inv.invoice_to == "Acme Company\n\n221B Baker Street\n12345 London\nUnited Kingdom"
 
 
 @pytest.mark.django_db
@@ -86,8 +99,8 @@ def test_address_vat_id(env):
     event, order = env
     event.settings.set('invoice_language', 'en')
     InvoiceAddress.objects.create(company='Acme Company', street='221B Baker Street',
-                                  name='Sherlock Holmes', zipcode='12345', city='London', country='UK',
-                                  vat_id='UK1234567', order=order)
+                                  name='Sherlock Holmes', zipcode='12345', city='London', country_old='UK',
+                                  country='', vat_id='UK1234567', order=order)
     inv = generate_invoice(order)
     assert inv.invoice_to == "Acme Company\nSherlock Holmes\n221B Baker Street\n12345 London\nUK\nVAT-ID: UK1234567"
 
@@ -219,3 +232,58 @@ def test_invoice_numbers(env):
     # test Invoice.number, too
     assert inv1.number == '{}-00001'.format(event.slug.upper())
     assert inv3.number == '{}-{}-3'.format(event.slug.upper(), order.code)
+
+
+@pytest.mark.django_db
+def test_invoice_number_prefixes(env):
+    event, order = env
+    event2 = Event.objects.create(
+        organizer=event.organizer, name='Dummy', slug='dummy2',
+        date_from=now(), plugins='pretix.plugins.banktransfer'
+    )
+    order2 = Order.objects.create(
+        event=event2, email='dummy2@dummy.test',
+        status=Order.STATUS_PENDING,
+        datetime=now(), expires=now() + timedelta(days=10),
+        total=0, payment_provider='banktransfer',
+        payment_fee=Decimal('0.25'), payment_fee_tax_rate=0,
+        payment_fee_tax_value=0, locale='en'
+    )
+    event.settings.set('invoice_numbers_consecutive', False)
+    event2.settings.set('invoice_numbers_consecutive', False)
+    assert generate_invoice(order).number == 'DUMMY-{}-1'.format(order.code)
+    assert generate_invoice(order2).number == 'DUMMY2-{}-1'.format(order2.code)
+
+    event.settings.set('invoice_numbers_consecutive', True)
+    event2.settings.set('invoice_numbers_consecutive', True)
+    event.settings.set('invoice_numbers_prefix', '')
+    event2.settings.set('invoice_numbers_prefix', '')
+
+    assert generate_invoice(order).number == 'DUMMY-00001'
+    assert generate_invoice(order).number == 'DUMMY-00002'
+    assert generate_invoice(order2).number == 'DUMMY2-00001'
+    assert generate_invoice(order2).number == 'DUMMY2-00002'
+
+    event.settings.set('invoice_numbers_prefix', 'shared_')
+    event2.settings.set('invoice_numbers_prefix', 'shared_')
+
+    assert generate_invoice(order).number == 'shared_00001'
+    assert generate_invoice(order2).number == 'shared_00002'
+    assert generate_invoice(order).number == 'shared_00003'
+    assert generate_invoice(order2).number == 'shared_00004'
+
+    event.settings.set('invoice_numbers_consecutive', False)
+    event2.settings.set('invoice_numbers_consecutive', False)
+    assert generate_invoice(order).number == 'shared_{}-6'.format(order.code)
+    assert generate_invoice(order2).number == 'shared_{}-6'.format(order2.code)
+
+    # Test database uniqueness check
+    with pytest.raises(DatabaseError):
+        Invoice.objects.create(
+            order=order,
+            event=order.event,
+            organizer=order.event.organizer,
+            date=now().date(),
+            locale='en',
+            invoice_no='00001',
+        )

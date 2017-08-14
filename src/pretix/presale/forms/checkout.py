@@ -19,6 +19,7 @@ from pretix.presale.signals import contact_form_fields, question_form_fields
 
 
 class ContactForm(forms.Form):
+    required_css_class = 'required'
     email = forms.EmailField(label=_('E-mail'),
                              help_text=_('Make sure to enter a valid email address. We will send you an order '
                                          'confirmation including a link that you need in case you want to make '
@@ -43,19 +44,52 @@ class ContactForm(forms.Form):
 
     def clean(self):
         if self.event.settings.order_email_asked_twice:
-            if self.cleaned_data['email'] != self.cleaned_data['email_repeat']:
+            if self.cleaned_data.get('email') != self.cleaned_data.get('email_repeat'):
                 raise ValidationError(_('Please enter the same email address twice.'))
 
 
+class BusinessBooleanRadio(forms.RadioSelect):
+    def __init__(self, attrs=None):
+        choices = (
+            ('individual', _('Individual customer')),
+            ('business', _('Business customer')),
+        )
+        super().__init__(attrs, choices)
+
+    def format_value(self, value):
+        try:
+            return {True: 'business', False: 'individual'}[value]
+        except KeyError:
+            return 'individual'
+
+    def value_from_datadict(self, data, files, name):
+        value = data.get(name)
+        return {
+            'business': True,
+            True: True,
+            'True': True,
+            'individual': False,
+            'False': False,
+            False: False,
+        }.get(value)
+
+
 class InvoiceAddressForm(forms.ModelForm):
+    required_css_class = 'required'
 
     class Meta:
         model = InvoiceAddress
-        fields = ('company', 'name', 'street', 'zipcode', 'city', 'country', 'vat_id')
+        fields = ('is_business', 'company', 'name', 'street', 'zipcode', 'city', 'country', 'vat_id')
         widgets = {
+            'is_business': BusinessBooleanRadio,
             'street': forms.Textarea(attrs={'rows': 2, 'placeholder': _('Street and Number')}),
-            'company': forms.TextInput(attrs={'data-typocheck-source': '1'}),
+            'company': forms.TextInput(attrs={'data-typocheck-source': '1',
+                                              'data-display-dependency': '#id_is_business_1'}),
             'name': forms.TextInput(attrs={'data-typocheck-source': '1'}),
+            'vat_id': forms.TextInput(attrs={'data-display-dependency': '#id_is_business_1'}),
+        }
+        labels = {
+            'is_business': ''
         }
 
     def __init__(self, *args, **kwargs):
@@ -70,9 +104,15 @@ class InvoiceAddressForm(forms.ModelForm):
                 if 'required' in f.widget.attrs:
                     del f.widget.attrs['required']
 
+            if event.settings.invoice_name_required:
+                self.fields['name'].required = True
+        else:
+            self.fields['company'].widget.attrs['data-required-if'] = '#id_is_business_1'
+            self.fields['name'].widget.attrs['data-required-if'] = '#id_is_business_0'
+
     def clean(self):
         data = self.cleaned_data
-        if not data['name'] and not data['company'] and self.event.settings.invoice_address_required:
+        if not data.get('name') and not data.get('company') and self.event.settings.invoice_address_required:
             raise ValidationError(_('You need to provide either a company name or your name.'))
 
 
@@ -118,6 +158,7 @@ class QuestionsForm(forms.Form):
     the attendee name for admission tickets, if the corresponding setting is enabled,
     as well as additional questions defined by the organizer.
     """
+    required_css_class = 'required'
 
     def __init__(self, *args, **kwargs):
         """
@@ -175,22 +216,26 @@ class QuestionsForm(forms.Form):
 
                 field = forms.BooleanField(
                     label=q.question, required=q.required,
-                    initial=initialbool, widget=widget
+                    help_text=q.help_text,
+                    initial=initialbool, widget=widget,
                 )
             elif q.type == Question.TYPE_NUMBER:
                 field = forms.DecimalField(
                     label=q.question, required=q.required,
+                    help_text=q.help_text,
                     initial=initial.answer if initial else None,
                     min_value=Decimal('0.00')
                 )
             elif q.type == Question.TYPE_STRING:
                 field = forms.CharField(
                     label=q.question, required=q.required,
+                    help_text=q.help_text,
                     initial=initial.answer if initial else None,
                 )
             elif q.type == Question.TYPE_TEXT:
                 field = forms.CharField(
                     label=q.question, required=q.required,
+                    help_text=q.help_text,
                     widget=forms.Textarea,
                     initial=initial.answer if initial else None,
                 )
@@ -198,6 +243,7 @@ class QuestionsForm(forms.Form):
                 field = forms.ModelChoiceField(
                     queryset=q.options.all(),
                     label=q.question, required=q.required,
+                    help_text=q.help_text,
                     widget=forms.RadioSelect,
                     initial=initial.options.first() if initial else None,
                 )
@@ -205,12 +251,14 @@ class QuestionsForm(forms.Form):
                 field = forms.ModelMultipleChoiceField(
                     queryset=q.options.all(),
                     label=q.question, required=q.required,
+                    help_text=q.help_text,
                     widget=forms.CheckboxSelectMultiple,
                     initial=initial.options.all() if initial else None,
                 )
             elif q.type == Question.TYPE_FILE:
                 field = forms.FileField(
                     label=q.question, required=q.required,
+                    help_text=q.help_text,
                     initial=initial.file if initial else None,
                     widget=UploadedFileWidget(position=pos, event=event, answer=initial)
                 )

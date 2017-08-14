@@ -1,20 +1,26 @@
 from datetime import timedelta
 
+import pytz
 from django.conf import settings
 from django.contrib import messages
 from django.core.urlresolvers import reverse
 from django.db.models import Count
 from django.http import FileResponse, Http404, HttpResponseNotAllowed
 from django.shortcuts import redirect, render
+from django.utils.formats import date_format
 from django.utils.functional import cached_property
 from django.utils.timezone import now
 from django.utils.translation import ugettext_lazy as _
-from django.views.generic import DetailView, ListView, TemplateView, View
+from django.views.generic import (
+    DetailView, FormView, ListView, TemplateView, View,
+)
+from i18nfield.strings import LazyI18nString
 
 from pretix.base.i18n import language
 from pretix.base.models import (
-    CachedFile, CachedTicket, Invoice, InvoiceAddress, Item, ItemVariation,
-    Order, Quota, generate_position_secret, generate_secret,
+    CachedCombinedTicket, CachedFile, CachedTicket, Invoice, InvoiceAddress,
+    Item, ItemVariation, LogEntry, Order, Quota, generate_position_secret,
+    generate_secret,
 )
 from pretix.base.models.event import SubEvent
 from pretix.base.services.export import export
@@ -23,7 +29,7 @@ from pretix.base.services.invoices import (
     regenerate_invoice,
 )
 from pretix.base.services.locking import LockTimeoutException
-from pretix.base.services.mail import SendMailException, mail
+from pretix.base.services.mail import SendMailException, render_mail
 from pretix.base.services.orders import (
     OrderChangeManager, OrderError, cancel_order, mark_order_paid,
 )
@@ -33,7 +39,7 @@ from pretix.base.views.async import AsyncAction
 from pretix.control.forms.filter import EventOrderFilterForm
 from pretix.control.forms.orders import (
     CommentForm, ExporterForm, ExtendForm, OrderContactForm, OrderLocaleForm,
-    OrderPositionAddForm, OrderPositionChangeForm,
+    OrderMailForm, OrderPositionAddForm, OrderPositionChangeForm,
 )
 from pretix.control.permissions import EventPermissionRequiredMixin
 from pretix.multidomain.urlreverse import build_absolute_uri
@@ -50,9 +56,16 @@ class OrderList(EventPermissionRequiredMixin, ListView):
     def get_queryset(self):
         qs = Order.objects.filter(
             event=self.request.event
-        ).annotate(pcnt=Count('positions')).select_related('invoice_address')
+        ).annotate(pcnt=Count('positions', distinct=True)).select_related('invoice_address')
         if self.filter_form.is_valid():
             qs = self.filter_form.filter_qs(qs)
+
+        if self.request.GET.get("ordering", "") != "":
+            p = self.request.GET.get("ordering", "")
+            p_admissable = ('-code', 'code', '-email', 'email', '-total', 'total', '-datetime',
+                            'datetime', '-status', 'status', 'pcnt', '-pcnt')
+            if p in p_admissable:
+                qs = qs.order_by(p)
 
         return qs.distinct()
 
@@ -228,9 +241,14 @@ class OrderTransition(OrderView):
                 'order': self.order,
             })
         elif self.order.status == Order.STATUS_PAID and to == 'r':
+            try:
+                cr = self.payment_provider.order_control_refund_render(self.order, self.request)
+            except TypeError:
+                cr = self.payment_provider.order_control_refund_render(self.order)
+
             return render(self.request, 'pretixcontrol/order/refund.html', {
                 'order': self.order,
-                'payment': self.payment_provider.order_control_refund_render(self.order),
+                'payment': cr,
             })
         else:
             return HttpResponseNotAllowed(['POST'])
@@ -315,26 +333,26 @@ class OrderResendLink(OrderView):
                 except InvoiceAddress.DoesNotExist:
                     invoice_name = ""
                     invoice_company = ""
-                mail(
-                    self.order.email, _('Your order: %(code)s') % {'code': self.order.code},
-                    self.order.event.settings.mail_text_resend_link,
-                    {
-                        'event': self.order.event.name,
-                        'url': build_absolute_uri(self.order.event, 'presale:event.order', kwargs={
-                            'order': self.order.code,
-                            'secret': self.order.secret
-                        }),
-                        'invoice_name': invoice_name,
-                        'invoice_company': invoice_company,
-                    },
-                    self.order.event, locale=self.order.locale
+                email_template = self.order.event.settings.mail_text_resend_link
+                email_context = {
+                    'event': self.order.event.name,
+                    'url': build_absolute_uri(self.order.event, 'presale:event.order', kwargs={
+                        'order': self.order.code,
+                        'secret': self.order.secret
+                    }),
+                    'invoice_name': invoice_name,
+                    'invoice_company': invoice_company,
+                }
+                email_subject = _('Your order: %(code)s') % {'code': self.order.code}
+                self.order.send_mail(
+                    email_subject, email_template, email_context,
+                    'pretix.event.order.email.resend', user=self.request.user
                 )
             except SendMailException:
                 messages.error(self.request, _('There was an error sending the mail. Please try again later.'))
                 return redirect(self.get_order_url())
 
         messages.success(self.request, _('The email has been queued to be sent.'))
-        self.order.log_action('pretix.event.order.resend', user=self.request.user)
         return redirect(self.get_order_url())
 
     def get(self, *args, **kwargs):
@@ -562,6 +580,7 @@ class OrderContactChange(OrderView):
                     op.secret = generate_position_secret()
                     op.save()
                 CachedTicket.objects.filter(order_position__order=self.order).delete()
+                CachedCombinedTicket.objects.filter(order=self.order).delete()
                 self.order.log_action('pretix.event.order.secret.changed', user=self.request.user)
 
             self.form.save()
@@ -602,6 +621,124 @@ class OrderLocaleChange(OrderView):
             messages.success(self.request, _('The order has been changed.'))
             return redirect(self.get_order_url())
         return self.get(*args, **kwargs)
+
+
+class OrderViewMixin:
+    def get_object(self, queryset=None):
+        try:
+            return Order.objects.get(
+                event=self.request.event,
+                code=self.kwargs['code'].upper()
+            )
+        except Order.DoesNotExist:
+            raise Http404()
+
+    @cached_property
+    def order(self):
+        return self.get_object()
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        ctx['order'] = self.order
+        return ctx
+
+
+class OrderSendMail(EventPermissionRequiredMixin, OrderViewMixin, FormView):
+    template_name = 'pretixcontrol/order/sendmail.html'
+    permission = 'can_change_orders'
+    form_class = OrderMailForm
+
+    def get_form_kwargs(self):
+        kwargs = super().get_form_kwargs()
+        kwargs['order'] = Order.objects.get(
+            event=self.request.event,
+            code=self.kwargs['code'].upper()
+        )
+        return kwargs
+
+    def form_invalid(self, form):
+        messages.error(self.request, _('We could not send the email. See below for details.'))
+        return super().form_invalid(form)
+
+    def form_valid(self, form):
+        tz = pytz.timezone(self.request.event.settings.timezone)
+        order = Order.objects.get(
+            event=self.request.event,
+            code=self.kwargs['code'].upper()
+        )
+        self.preview_output = {}
+        try:
+            invoice_name = order.invoice_address.name
+            invoice_company = order.invoice_address.company
+        except InvoiceAddress.DoesNotExist:
+            invoice_name = ""
+            invoice_company = ""
+        with language(order.locale):
+            email_context = {
+                'event': order.event,
+                'code': order.code,
+                'date': date_format(order.datetime.astimezone(tz), 'SHORT_DATETIME_FORMAT'),
+                'expire_date': date_format(order.expires, 'SHORT_DATE_FORMAT'),
+                'url': build_absolute_uri(order.event, 'presale:event.order', kwargs={
+                    'order': order.code,
+                    'secret': order.secret
+                }),
+                'invoice_name': invoice_name,
+                'invoice_company': invoice_company,
+            }
+        email_template = LazyI18nString(form.cleaned_data['message'])
+        email_content = render_mail(email_template, email_context)[0]
+        if self.request.POST.get('action') == 'preview':
+            self.preview_output = []
+            self.preview_output.append(
+                _('Subject: {subject}').format(subject=form.cleaned_data['subject']))
+            self.preview_output.append(email_content)
+            return self.get(self.request, *self.args, **self.kwargs)
+        else:
+            try:
+                order.send_mail(
+                    form.cleaned_data['subject'], email_template,
+                    email_context, 'pretix.event.order.email.custom_sent',
+                    self.request.user
+                )
+                messages.success(self.request, _('Your message has been queued and will be sent to {}.'.format(order.email)))
+            except SendMailException:
+                messages.error(
+                    self.request,
+                    _('Failed to send mail to the following user: {}'.format(order.email))
+                )
+            return super(OrderSendMail, self).form_valid(form)
+
+    def get_success_url(self):
+        return reverse('control:event.order', kwargs={
+            'event': self.request.event.slug,
+            'organizer': self.request.event.organizer.slug,
+            'code': self.kwargs['code']}
+        )
+
+    def get_context_data(self, *args, **kwargs):
+        ctx = super().get_context_data(*args, **kwargs)
+        ctx['preview_output'] = getattr(self, 'preview_output', None)
+        return ctx
+
+
+class OrderEmailHistory(EventPermissionRequiredMixin, OrderViewMixin, ListView):
+    template_name = 'pretixcontrol/order/mail_history.html'
+    permission = 'can_view_orders'
+    model = LogEntry
+    context_object_name = 'logs'
+    paginate_by = 5
+
+    def get_queryset(self):
+        order = Order.objects.filter(
+            event=self.request.event,
+            code=self.kwargs['code'].upper()
+        ).first()
+        qs = order.all_logentries()
+        qs = qs.filter(
+            action_type__contains="order.email"
+        )
+        return qs
 
 
 class OverView(EventPermissionRequiredMixin, TemplateView):

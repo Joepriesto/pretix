@@ -4,7 +4,7 @@ import os
 import string
 from datetime import datetime, time
 from decimal import Decimal
-from typing import List, Union
+from typing import Any, Dict, List, Union
 
 import pytz
 from django.conf import settings
@@ -19,7 +19,11 @@ from django.utils.html import escape
 from django.utils.safestring import mark_safe
 from django.utils.timezone import make_aware, now
 from django.utils.translation import pgettext_lazy, ugettext_lazy as _
+from django_countries.fields import CountryField
+from i18nfield.strings import LazyI18nString
 
+from pretix.base.i18n import language
+from pretix.base.models import User
 from pretix.base.reldate import RelativeDateWrapper
 
 from ..decimal import round_decimal
@@ -88,6 +92,8 @@ class Order(LoggedModel):
     :type total: decimal.Decimal
     :param comment: An internal comment that will only be visible to staff, and never displayed to the user
     :type comment: str
+    :param download_reminder_sent: A field to indicate whether a download reminder has been sent.
+    :type download_reminder_sent: boolean
     :param meta_info: Additional meta information on the order, JSON-encoded.
     :type meta_info: str
     """
@@ -175,6 +181,10 @@ class Order(LoggedModel):
                     "convenience.")
     )
     expiry_reminder_sent = models.BooleanField(
+        default=False
+    )
+
+    download_reminder_sent = models.BooleanField(
         default=False
     )
     meta_info = models.TextField(
@@ -293,6 +303,9 @@ class Order(LoggedModel):
 
     @property
     def can_user_cancel(self) -> bool:
+        """
+        Returns whether or not this order can be canceled by the user.
+        """
         positions = self.positions.all().select_related('item')
         cancelable = all([op.item.allow_cancel for op in positions])
         return self.event.settings.cancel_allow_user and cancelable
@@ -306,6 +319,10 @@ class Order(LoggedModel):
 
     @property
     def ticket_download_date(self):
+        """
+        Returns the first date the tickets for this order can be downloaded or ``None`` if there is no
+        restriction.
+        """
         dl_date = self.event.settings.get('ticket_download_date', as_type=RelativeDateWrapper)
         if dl_date:
             if self.event.has_subevents:
@@ -386,6 +403,48 @@ class Order(LoggedModel):
         except Quota.QuotaExceededException as e:
             return str(e)
         return True
+
+    def send_mail(self, subject: str, template: Union[str, LazyI18nString],
+                  context: Dict[str, Any]=None, log_entry_type: str='pretix.event.order.email.sent',
+                  user: User=None, headers: dict=None, sender: str=None):
+        """
+        Sends an email to the user that placed this order. Basically, this method does two things:
+
+        * Call ``pretix.base.services.mail.mail`` with useful values for the ``event``, ``locale``, ``recipient`` and
+          ``order`` parameters.
+
+        * Create a ``LogEntry`` with the email contents.
+
+        :param subject: Subject of the email
+        :param template: LazyI18nString or template filename, see ``pretix.base.services.mail.mail`` for more details
+        :param context: Dictionary to use for rendering the template
+        :param log_entry_type: Key to be used for the log entry
+        :param user: Administrative user who triggered this mail to be sent
+        :param headers: Dictionary with additional mail headers
+        :param sender: Custom email sender.
+        """
+        from pretix.base.services.mail import SendMailException, mail, render_mail
+
+        recipient = self.email
+        email_content = render_mail(template, context)[0]
+        try:
+            with language(self.locale):
+                mail(
+                    recipient, subject, template, context,
+                    self.event, self.locale, self, headers, sender
+                )
+        except SendMailException:
+            raise
+        else:
+            self.log_action(
+                log_entry_type,
+                user=user,
+                data={
+                    'subject': subject,
+                    'message': email_content,
+                    'recipient': recipient
+                }
+            )
 
 
 def answerfile_name(instance, filename: str) -> str:
@@ -727,14 +786,17 @@ class CartPosition(AbstractPosition):
 
 class InvoiceAddress(models.Model):
     last_modified = models.DateTimeField(auto_now=True)
+    is_business = models.BooleanField(default=False, verbose_name=_('Business customer'))
     order = models.OneToOneField(Order, null=True, blank=True, related_name='invoice_address')
     company = models.CharField(max_length=255, blank=True, verbose_name=_('Company name'))
     name = models.CharField(max_length=255, verbose_name=_('Full name'), blank=True)
     street = models.TextField(verbose_name=_('Address'), blank=False)
     zipcode = models.CharField(max_length=30, verbose_name=_('ZIP code'), blank=False)
     city = models.CharField(max_length=255, verbose_name=_('City'), blank=False)
-    country = models.CharField(max_length=255, verbose_name=_('Country'), blank=False)
-    vat_id = models.CharField(max_length=255, blank=True, verbose_name=_('VAT ID'))
+    country_old = models.CharField(max_length=255, verbose_name=_('Country'), blank=False)
+    country = CountryField(verbose_name=_('Country'), blank=False, blank_label=_('Select country'))
+    vat_id = models.CharField(max_length=255, blank=True, verbose_name=_('VAT ID'),
+                              help_text=_('Only for business customers within the EU.'))
 
 
 def cachedticket_name(instance, filename: str) -> str:

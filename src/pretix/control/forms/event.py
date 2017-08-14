@@ -11,7 +11,8 @@ from pytz import common_timezones, timezone
 from pretix.base.forms import I18nModelForm, PlaceholderValidator, SettingsForm
 from pretix.base.models import Event, Organizer
 from pretix.base.reldate import RelativeDateField, RelativeDateTimeField
-from pretix.control.forms import ExtFileField
+from pretix.control.forms import ExtFileField, SlugWidget
+from pretix.multidomain.urlreverse import build_absolute_uri
 
 
 class EventWizardFoundationForm(forms.Form):
@@ -77,6 +78,7 @@ class EventWizardBasicsForm(I18nModelForm):
             'presale_start': forms.DateTimeInput(attrs={'class': 'datetimepicker'}),
             'presale_end': forms.DateTimeInput(attrs={'class': 'datetimepicker',
                                                       'data-date-after': '#id_basics-presale_start'}),
+            'slug': SlugWidget
         }
 
     def __init__(self, *args, **kwargs):
@@ -88,6 +90,7 @@ class EventWizardBasicsForm(I18nModelForm):
         self.initial['timezone'] = get_current_timezone_name()
         self.fields['locale'].choices = [(a, b) for a, b in settings.LANGUAGES if a in self.locales]
         self.fields['location'].widget.attrs['rows'] = '3'
+        self.fields['slug'].widget.prefix = build_absolute_uri(self.organizer, 'presale:organizer.index')
         if self.has_subevents:
             del self.fields['presale_start']
             del self.fields['presale_end']
@@ -381,10 +384,8 @@ class PaymentSettingsForm(SettingsForm):
     def clean(self):
         cleaned_data = super().clean()
         payment_term_last = cleaned_data.get('payment_term_last')
-        print(payment_term_last)
         if payment_term_last and self.obj.presale_end:
-            print(payment_term_last, payment_term_last.datetime(self.obj), self.obj.presale_end.date())
-            if payment_term_last.datetime(self.obj) < self.obj.presale_end.date():
+            if payment_term_last.date(self.obj) < self.obj.presale_end.date():
                 self.add_error(
                     'payment_term_last',
                     _('The last payment date cannot be before the end of presale.'),
@@ -435,6 +436,14 @@ class InvoiceSettingsForm(SettingsForm):
         required=False,
         widget=forms.CheckboxInput(attrs={'data-checkbox-dependency': '#id_invoice_address_asked'}),
     )
+    invoice_name_required = forms.BooleanField(
+        label=_("Require customer name"),
+        required=False,
+        widget=forms.CheckboxInput(
+            attrs={'data-checkbox-dependency': '#id_invoice_address_asked',
+                   'data-inverse-dependency': '#id_invoice_address_required'}
+        ),
+    )
     invoice_address_vatid = forms.BooleanField(
         label=_("Ask for VAT ID"),
         help_text=_("Does only work if an invoice address is asked for. VAT ID is not required."),
@@ -451,6 +460,14 @@ class InvoiceSettingsForm(SettingsForm):
         label=_("Generate invoices with consecutive numbers"),
         help_text=_("If deactivated, the order code will be used in the invoice number."),
         required=False
+    )
+    invoice_numbers_prefix = forms.CharField(
+        label=_("Invoice number prefix"),
+        help_text=_("This will be prepended to invoice numbers. If you leave this field empty, your event slug will "
+                    "be used followed by a dash. Attention: If multiple events within the same organization use the "
+                    "same value in this field, they will share their number range, i.e. every full number will be "
+                    "used at most once over all of your events. This setting only affects future invoices."),
+        required=False,
     )
     invoice_generate = forms.ChoiceField(
         label=_("Generate invoices"),
@@ -510,13 +527,14 @@ class InvoiceSettingsForm(SettingsForm):
         self.fields['invoice_renderer'].choices = [
             (r.identifier, r.verbose_name) for r in event.get_invoice_renderers().values()
         ]
+        self.fields['invoice_numbers_prefix'].widget.attrs['placeholder'] = event.slug.upper() + '-'
 
 
 class MailSettingsForm(SettingsForm):
     mail_prefix = forms.CharField(
         label=_("Subject prefix"),
-        help_text=_("This will be prepended to the subject of all outgoing emails. This could be a short form of "
-                    "your event name."),
+        help_text=_("This will be prepended to the subject of all outgoing emails, formatted as [prefix]. "
+                    "Choose, for example, a short form of your event name."),
         required=False
     )
     mail_from = forms.EmailField(
@@ -603,6 +621,29 @@ class MailSettingsForm(SettingsForm):
         widget=I18nTextarea,
         help_text=_("Available placeholders: {event}, {code}, {url}"),
         validators=[PlaceholderValidator(['{event}', '{code}', '{url}'])]
+    )
+    mail_text_order_custom_mail = I18nFormField(
+        label=_("Text"),
+        required=False,
+        widget=I18nTextarea,
+        help_text=_("Available placeholders: {expire_date}, {event}, {code}, {date}, {url}, "
+                    "{invoice_name}, {invoice_company}"),
+        validators=[PlaceholderValidator(['{expire_date}', '{event}', '{code}', '{date}', '{url}',
+                                          '{invoice_name}', '{invoice_company}'])]
+    )
+    mail_text_download_reminder = I18nFormField(
+        label=_("Text"),
+        required=False,
+        widget=I18nTextarea,
+        help_text=_("Available placeholders: {event}, {url}"),
+        validators=[PlaceholderValidator(['{event}', '{url}'])]
+    )
+    mail_days_download_reminder = forms.IntegerField(
+        label=_("Number of days"),
+        required=False,
+        min_value=0,
+        help_text=_("This email will be sent out this many days before the order event starts. If the "
+                    "field is empty, the mail will never be sent.")
     )
     smtp_use_custom = forms.BooleanField(
         label=_("Use custom SMTP server"),
